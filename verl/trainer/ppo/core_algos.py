@@ -105,6 +105,7 @@ class AdvantageEstimator(str, Enum):
     GPG = "gpg"
     RLOO_VECTORIZED = "rloo_vectorized"
     GRPO_VECTORIZED = "grpo_vectorized"
+    RAPO = "rapo"
 
 
 ADV_ESTIMATOR_REGISTRY: dict[str, Any] = {}
@@ -353,6 +354,117 @@ def compute_grpo_vectorized_outcome_advantage(
             scalars = scores - mean_g[g]
         advantages = scalars.unsqueeze(-1) * response_mask
         return advantages, advantages
+
+
+@register_adv_est(AdvantageEstimator.RAPO)  # or simply: @register_adv_est("rapo")
+def compute_rapo_outcome_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    epsilon: float = 1e-6,
+    norm_adv_by_std_in_grpo: bool = True,
+    config: Optional[AlgoConfig] = None,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Compute advantage for RAPO (Rewards-Aware Policy Optimization).
+    Based on GRPO but designed to work with forward KL divergence and
+    reward-aware reference policy reweighting.
+
+    See: https://arxiv.org/abs/2510.03865
+
+    The advantage computation is similar to GRPO:
+    A_i = (r_i - mean(r)) / std(r)
+
+    The key differences in RAPO are in the KL penalty (forward KL) and
+    reference policy reweighting, which are handled separately in the loss function.
+
+    Args:
+        token_level_rewards: `(torch.Tensor)`
+            shape is (bs, response_length)
+        response_mask: `(torch.Tensor)`
+            shape is (bs, response_length)
+        index: `(np.ndarray)`
+            index array for grouping
+        epsilon: `(float)`
+            small value to avoid division by zero
+        norm_adv_by_std_in_grpo: `(bool)`
+            whether to scale the advantage by std
+        config: `(Optional[AlgoConfig])`
+            algorithm configuration object
+
+    Returns:
+        advantages: `(torch.Tensor)`
+            shape is (bs, response_length)
+        Returns: `(torch.Tensor)`
+            shape is (bs, response_length)
+    """
+    scores = token_level_rewards.sum(dim=-1)
+
+    id2score = defaultdict(list)
+    id2mean = {}
+    id2std = {}
+
+    with torch.no_grad():
+        bsz = scores.shape[0]
+        for i in range(bsz):
+            id2score[index[i]].append(scores[i])
+        for idx in id2score:
+            if len(id2score[idx]) == 1:
+                id2mean[idx] = torch.tensor(0.0)
+                id2std[idx] = torch.tensor(1.0)
+            elif len(id2score[idx]) > 1:
+                scores_tensor = torch.stack(id2score[idx])
+                id2mean[idx] = torch.mean(scores_tensor)
+                id2std[idx] = torch.std(scores_tensor)
+            else:
+                raise ValueError(f"no score in prompt index: {idx}")
+        for i in range(bsz):
+            if norm_adv_by_std_in_grpo:
+                scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
+            else:
+                scores[i] = scores[i] - id2mean[index[i]]
+        scores = scores.unsqueeze(-1) * response_mask
+
+    return scores, scores
+
+
+def compute_rapo_phi_reweight(
+    rewards: torch.Tensor,
+    phi_type: str = "tanh",
+    tau_max: float = 2.2,
+) -> torch.Tensor:
+    """
+    Compute the reward-aware reweighting factor φ(r) for RAPO.
+
+    The reweighted reference policy is: π̃_ref(y|x) ∝ π_ref(y|x)^φ(r(x,y))
+
+    When reward is high, φ(r) → 1, keeping π̃_ref close to π_ref (exploitation).
+    When reward is low, φ(r) → 0, pushing π̃_ref toward uniform (exploration).
+
+    Args:
+        rewards: `(torch.Tensor)` shape (bs,) - rewards for each sample
+        phi_type: `(str)` - type of φ function: "tanh" or "inverse"
+        tau_max: `(float)` - parameter for inverse-proportional function
+
+    Returns:
+        phi_values: `(torch.Tensor)` shape (bs,) - reweighting factors in [0, 1]
+    """
+    if phi_type == "tanh":
+        # φ(r) = (1 + tanh(r)) / 2, maps to [0, 1]
+        phi = (1 + torch.tanh(rewards)) / 2
+    elif phi_type == "inverse":
+        # φ(r) = 1 / (τ_max - r), for r in [0, 1], gives φ in [1/τ_max, 1/(τ_max-1)]
+        phi = 1.0 / (tau_max - rewards)
+        # Normalize to [0, 1] range
+        phi_min = 1.0 / tau_max
+        phi_max = 1.0 / (tau_max - 1.0)
+        phi = (phi - phi_min) / (phi_max - phi_min + 1e-8)
+    else:
+        # Default: no reweighting
+        phi = torch.ones_like(rewards)
+
+    return torch.clamp(phi, min=0.0, max=1.0)
 
 
 @register_adv_est(AdvantageEstimator.GRPO_PASSK)  # or simply: @register_adv_est("grpo_passk")
@@ -1448,6 +1560,21 @@ def kl_penalty_forward(logprob: torch.FloatTensor, ref_logprob: torch.FloatTenso
     if kl_penalty == "full":
         # so, here logprob and ref_logprob should contain the logits for every token in vocabulary
         raise NotImplementedError
+
+    # RAPO: Forward KL divergence with low variance estimation
+    # D_KL(π_ref || π_θ) = E_π_ref[log(π_ref/π_θ)]
+    # Low variance estimator: h(r) = r*log(r) - r + 1 where r = π_ref/π_θ
+    # See: https://arxiv.org/abs/2510.03865 (RAPO paper)
+    if kl_penalty in ("forward_low_var_kl", "rapo_kl"):
+        # r = π_ref / π_θ = exp(ref_logprob - logprob)
+        log_ratio = ref_logprob - logprob
+        # For numerical stability
+        log_ratio = torch.clamp(log_ratio, min=-20, max=20)
+        ratio = torch.exp(log_ratio)
+        # h(r) = r * log(r) - r + 1
+        # Note: when r -> 0, h(r) -> 1, allowing exploration in low π_ref regions
+        kld = (ratio * log_ratio - ratio + 1).contiguous()
+        return torch.clamp(kld, min=-10, max=10)
 
     raise NotImplementedError
 
